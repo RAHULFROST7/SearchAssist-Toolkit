@@ -10,12 +10,21 @@ const fuzzball = require("fuzzball");
 const path = require("path");
 const similarity = require('compute-cosine-similarity');
 const { constrainedMemory } = require("process");
+const {evaluateAnswerRetrieval} = require('./retrievalEvaluator')
 
 const CSV_file_path = "../data/user_query.csv";
 const output_file_path = "../output/output.csv";
 const jsonFilePath = "../config/creds.json";
-
+const promptsFilePath = "./share/Prompts/Prompts.json";
 app.use(bodyParser.json());
+
+var prompts = JSON.parse(fs.readFileSync(promptsFilePath, 'utf8'));
+const { OpenAI, OpenAIApi } = require("openai");
+
+
+const openai = new OpenAI({
+  apiKey: "", // This is the default and can be omitted
+});
 
 let headers;
 
@@ -57,6 +66,56 @@ let payload = {
   pageNumber: 0,
 };
 
+let externalSearchPayload = {
+  "query": "test",
+  "queryType": "relevanceWithMetaFilter",
+  "MaxNumberOfResults": 2,
+  "includeChunksInResponse": false,
+  "customData": {
+    "userContext": {
+    }
+  },
+  "metaFilters": []
+};
+
+payload = {
+  "query": "how do I make feedback profile private or public?",
+  "maxNumOfResults": 5,
+  "streamId": "st-d70ae9b0-ece8-51ae-880a-48c4a5215285",
+  "lang": "en",
+  "isDev": true,
+  "searchRequestId": "fsh-1ad67e17-4513-5e84-8ade-38587da89172",
+  "customize": false,
+  "answerSearch": true,
+  "userId": "u-5e19737b-2ccd-523d-848c-cc3d534ec699",
+  "indexPipelineId": "fip-dcc9055e-43e5-513a-bad3-4378a10efb2f",
+  "queryPipelineId": "fqp-628152d1-0d7c-5ae4-bda3-334693aef33a",
+  "messagePayload": {
+      "clientMessageId": 1709043165491,
+      "message": {
+          "body": "how do I make feedback profile private or public?"
+      },
+      "resourceId": "/bot.message",
+      "timeDateDay": "27/2/2024, 19:42:45",
+      "currentPage": "https://searchassist-pilot.kore.ai/home/",
+      "meta": {
+          "timezone": "Asia/Calcutta",
+          "locale": "en-GB"
+      },
+      "location": "Hyderabad",
+      "country": "India",
+      "client": "botbuilder",
+      "botInfo": {
+          "chatBot": "GUIDE2",
+          "taskBotId": "st-d70ae9b0-ece8-51ae-880a-48c4a5215285",
+          "customData": {
+              "userContext": {}
+          }
+      }
+  },
+  "pageNumber": 0
+}
+
 //server 1 code
 const embedings_headers = {
   "Content-Type": "application/json",
@@ -80,6 +139,7 @@ async function generate_embeddings(sentence) {
 
 const { pipeline } = require('stream');
 const { Readable } = require('stream');
+const { result } = require("underscore");
 
 function appendToCSV(jsonObject, filePath) {
   // Convert the JSON object to a CSV row
@@ -110,7 +170,10 @@ function appendToJSON(jsonObject, filePath) {
     const updatedJson = JSON.stringify(existingData, null, 2); // The third argument (2) is the number of spaces for indentation
     
     // Write the updated JSON data back to the file
-    fs.writeFileSync(filePath, updatedJson, 'utf8');
+    fs.writeFileSync(filePath, updatedJson, 'utf8', { flag: 'wx' }, function (err) {
+      if (err) throw err;
+      console.log("It's saved!");
+  });
     console.log('Data appended to JSON file successfully.');
 
   }
@@ -121,8 +184,7 @@ function appendToJSON(jsonObject, filePath) {
   }
  
 
-
-async function makeAPostRequest(query, details) {
+async function prepareInternalSearchPayload(query, details, csv_data){
   const host = details["host"];
   const auth_token = details["auth_token"];
   const stream_id = details["stream_id"];
@@ -130,7 +192,9 @@ async function makeAPostRequest(query, details) {
   const index_pipeline_id = details["index_pipeline_id"];
   const query_pipeline_id = details["query_pipeline_id"];
   const user_id = details["user_id"];
-  const search_url =
+  const fsh_id = details["fsh_id"];
+  let search_url = 
+    "https://" + 
     host +
     "/searchassistapi/businessapp/searchsdk/stream/" +
     stream_id +
@@ -138,27 +202,39 @@ async function makeAPostRequest(query, details) {
     search_index_id +
     "/search";
 
+  let debug_url =`"https://${host}/searchassistapi/businessapp/searchsdk/stream/${stream_id}/${search_index_id}/context/${query_pipeline_id}/${fsh_id}`;
+
   payload["query"] = query;
   payload["queryPipelineId"] = query_pipeline_id;
   payload["indexPipelineId"] = index_pipeline_id;
   payload["streamId"] = stream_id;
   payload["userId"] = user_id;
   headers = { Authorization: auth_token, "Content-Type": "application/json" };
+  return {search_url, payload, headers, debug_url}
+}
 
+async function makeAPostRequest(query, details, csv_data, index) {
+  
+  let search_url, payload, headers, debug_url;
   let search_answer_response;
   let debug_answer_response;
-
+  let result = await prepareInternalSearchPayload(query, details, csv_data);
+  ({search_url, payload, headers, debug_url} = result);
   try {
+    console.log(`Searching Query ${index}: ${payload.query}`)
     const search_response = await axios.post(search_url, payload, { headers });
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    let sleepTime = 3000;
+    console.log(`Sleeping for ${sleepTime} seconds`)
+    await new Promise((resolve) => setTimeout(resolve, sleepTime));
     search_answer_response = search_response.data;
 
-    const debug_url = `${host}/searchassistapi/businessapp/searchsdk/stream/${stream_id}/${search_index_id}/context/${query_pipeline_id}`;
-
     try {
-      const debug_response = await axios.get(debug_url, { headers });
-      debug_answer_response = debug_response.data;
-
+      let debug_response;
+      if(debug_url){
+        debug_response = await axios.get(debug_url, { headers });
+        // console.log("debug_response:",debug_response)
+      }
+      debug_answer_response = debug_response?.data || null;
       return {
         search_answer_response,
         debug_answer_response,
@@ -171,7 +247,7 @@ async function makeAPostRequest(query, details) {
         search_answer_response,
         debug_answer_response: null,
         search_error: null,
-        debug_error,
+        "debug_error": debug_error,
       };
     }
   } catch (error) {
@@ -187,7 +263,7 @@ async function makeAPostRequest(query, details) {
       search_answer_response: null,
       debug_answer_response: null,
       debug_error: null,
-      search_error,
+      search_error: error,
     };
   }
 }
@@ -217,13 +293,11 @@ async function fuzzyMatch(ref, refList) {
 async function ansFuzzyMatch(ref, refList) {
   let max = 0
   let index = -1
-  let ref_index_data
   for (i = 0; i < refList.length; i++) {
     const ratio = fuzzball.partial_ratio(ref, refList[i]);
     if (ratio > max) {
       max = ratio
       index = i
-      // console.log(`into the loop >>> i : ${i} max : ${max}`)
     }
   }
   return [max, index, refList[index]];
@@ -248,107 +322,142 @@ async function stringIncludes(ref, refList) {
   return [false, -1];
 }
 
-async function get_metrics(user_input, snippet_title, snippet_content, snippet_urls, snippet_scores = [], embedings_model,debug = false) {
+async function correctnessEvaluatorUsingLLM(query, expected_Ans, snippet_content) {
+  try{
+    console.log("Evaluationg Answer for Query: ", query);
+    let snippet_answer = snippet_content.join(' ')
+    let correctnessEvaluationPrompt = prompts?.correctnessEvaluationPrompt || "";
+    correctnessEvaluationPrompt = correctnessEvaluationPrompt.replace("{reference_answer}", expected_Ans).replace("{generated_answer}", snippet_answer).replace("{query}", query)
+    const chatCompletion = await openai.chat.completions.create({
+      messages: [{ role: 'system', content: correctnessEvaluationPrompt }],
+      model: 'gpt-3.5-turbo',
+    });
+    let evalResponse = chatCompletion?.choices[0]?.message?.content || "{}";
+    
+    return evalResponse;
+  } catch(error){
+    console.log("Evaluation Error: ", error);
+    return `Answer evaluation Failed with error: ${error}`
+  }
+}
+
+async function get_metrics(user_input, graph_answer, snippet_title, snippet_content, snippet_urls, embeddings_model, options = {}) {
   const result_metrics = {}
+  let {debug, llmEvaluation, retrievalEvaluation} = options;
   try {
     snippet_urls = snippet_urls.map(url => decodeURIComponent(url))
-  const url_status = await fuzzyMatch(user_input.Expected_URL, snippet_urls);
-  const title_status = await fuzzyMatch(user_input.Expected_Title, snippet_title);
-  //   console.log(`URL_score : ${url_status}, title_status : ${title_status}`)
+    const url_status = await fuzzyMatch(user_input.Expected_URL, snippet_urls);
+    const title_status = await fuzzyMatch(user_input.Expected_Title, snippet_title);
+    //   console.log(`URL_score : ${url_status}, title_status : ${title_status}`)
 
-  //   const result={ans_snipprt:,ans_staus,url_status,title_status}
-  result_metrics['url_status'] = url_status
-  result_metrics['title_status'] = title_status
-  if (!debug){
-    result_metrics['actual_title'] = snippet_title[0];
-    result_metrics['actual_url'] = snippet_urls[0];
-    result_metrics['actual_score'] = snippet_scores[0];
-  }
-  const direct_content_score = await directStringComparison(user_input.Expected_Ans, snippet_content);
-  result_metrics['Chunk_number_direct_content_score'] = direct_content_score[1]
+    //   const result={ans_snipprt:,ans_staus,url_status,title_status}
+    result_metrics['url_status'] = url_status
+    result_metrics['title_status'] = title_status
+    if (!debug) {
+      result_metrics['actual_title'] = snippet_title[0];
+      result_metrics['actual_url'] = snippet_urls[0]
+    }
+    if (llmEvaluation){
+      let evalResponse = await correctnessEvaluatorUsingLLM(user_input.User_Query, user_input.Expected_Ans, snippet_content);
+      result_metrics["evalResponse"] = evalResponse;
+      // Split the inputString into feedback and score
+      const [feedback, score] = evalResponse.split('Score: ');
 
-  if (!direct_content_score[0]) {
-    const stringInclude_score = await stringIncludes(user_input.Expected_Ans, snippet_content);
-    result_metrics['Chunk_number_stringInclude_score'] = stringInclude_score[1]
+      // Create an object
+      let evaluationObject = {
+        feedback: feedback.split('Feedback: ')[1], // Remove "Feedback: " from the beginning
+        score: parseInt(score) // Parse the score as an integer
+      };
+      result_metrics["evaluationFeedback"] = evaluationObject.feedback || "";
+      result_metrics["evaluationScore"] = evaluationObject.score || -1;
+    }
+    if(retrievalEvaluation){
+     let debug_answer_response = options?.debug_answer_response || {};
+     let retrievalEvalResult = await evaluateAnswerRetrieval(graph_answer, user_input, debug_answer_response);
+     result_metrics["retrievalEvalStatus"] = retrievalEvalResult?.comparedGuide || "N/A";
+     result_metrics["sourceUsed"] = retrievalEvalResult?.extractionGuides || "N/A";
+     result_metrics["expectedChunkRanks"] = retrievalEvalResult?.expectedChunkRanks;
+    }
+    const direct_content_score = await directStringComparison(user_input.Expected_Ans, snippet_content);
+    result_metrics['Chunk_number_direct_content_score'] = direct_content_score[1]
 
-    if (!stringInclude_score[0]) {
-      const content_score = await ansFuzzyMatch(user_input.Expected_Ans, snippet_content);
-      //   console.log(`score : ${content_score}`)
-      result_metrics['Chunk_number'] = content_score[1]
-      result_metrics['data_index'] = content_score[2]
+    if (!direct_content_score[0]) {
+      const stringInclude_score = await stringIncludes(user_input.Expected_Ans, snippet_content);
+      result_metrics['Chunk_number_stringInclude_score'] = stringInclude_score[1]
 
-      if (content_score[0] < 85) {
-        result_metrics['Ans_Status'] = false
-        result_metrics['Chunk_number'] = -1
+      if (!stringInclude_score[0]) {
+        const content_score = await ansFuzzyMatch(user_input.Expected_Ans, snippet_content);
+        //   console.log(`score : ${content_score}`)
+        result_metrics['Chunk_number'] = content_score[1]
+        result_metrics['data_index'] = content_score[2]
 
-        if (embedings_model) {
-          // console.log("----entering into fourth stage----")
+        if (content_score[0] < 85) {
+          result_metrics['Ans_Status'] = false
+          result_metrics['Chunk_number'] = -1
 
-          const embedding1 = await generate_embeddings(snippet_content);
-          const embedding2 = await generate_embeddings(user_input.Expected_Ans);
+          if (embeddings_model) {
+            // console.log("----entering into fourth stage----")
 
-          let max_embedding_score = 0
-          let index_embedding
-          let cosineSimilarity
-          let embedding_data_index
+            const embedding1 = await generate_embeddings(snippet_content);
+            const embedding2 = await generate_embeddings(user_input.Expected_Ans);
 
-          for (let i = 0; i < embedding1.length; i++) {
-            cosineSimilarity = similarity(embedding1[i], embedding2)
-            // console.log(`${cosineSimilarity} ---- ${embedding1.length} ---- ${snippet_content.length}`)
-            if (max_embedding_score < cosineSimilarity) {
-              max_embedding_score = cosineSimilarity
-              index_embedding = i
-              embedding_data_index = snippet_content[i]
-              // console.log(`entered loop >> ${max_embedding_score} >> index at ${index_embedding}`)
+            let max_embedding_score = 0
+            let index_embedding
+            let cosineSimilarity
+            let embedding_data_index
+
+            for (let i = 0; i < embedding1.length; i++) {
+              cosineSimilarity = similarity(embedding1[i], embedding2)
+              // console.log(`${cosineSimilarity} ---- ${embedding1.length} ---- ${snippet_content.length}`)
+              if (max_embedding_score < cosineSimilarity) {
+                max_embedding_score = cosineSimilarity
+                index_embedding = i
+                embedding_data_index = snippet_content[i]
+                // console.log(`entered loop >> ${max_embedding_score} >> index at ${index_embedding}`)
+              }
+            }
+
+            result_metrics['data_index'] = embedding_data_index
+
+            if (max_embedding_score < 0.85) {
+              result_metrics['Ans_Status'] = false;
+            } else {
+              result_metrics['Ans_Status'] = true
+              result_metrics['Chunk_number'] = index_embedding
+
             }
           }
-
-          result_metrics['data_index'] = embedding_data_index
-
-          // console.log(`cosineSimilarity : ${max_embedding_score}`)
-          if (max_embedding_score < 0.85) {
-            result_metrics['Ans_Status'] = false;
-          }
-          else {
-            result_metrics['Ans_Status'] = true
-            result_metrics['Chunk_number'] = index_embedding
-
-          }
+        } else {
+          result_metrics['Ans_Status'] = true
+          result_metrics['data_index'] = content_score[2]
         }
-      }
-      else {
+      } else {
         result_metrics['Ans_Status'] = true
-        result_metrics['data_index'] = content_score[2]
+        result_metrics['data_index'] = stringInclude_score[2]
       }
-    }
-    else {
+    } else {
       result_metrics['Ans_Status'] = true
-      result_metrics['data_index'] = stringInclude_score[2]
+      result_metrics['data_index'] = direct_content_score[2]
     }
-  }
-  else {
-    result_metrics['Ans_Status'] = true
-    result_metrics['data_index'] = direct_content_score[2]
-  }
-  }
-  catch(error){
+  } catch (error) {
     console.log(error)
   }
 
   return result_metrics;
 }
 
-async function pre_processing(search_call, user_input, embedings_model) {
+async function pre_processing(search_call, user_input, embeddings_model) {
   let payload_response
+  let result_metrics = {};
+  let debugger_result_metrics = {};
   try {
     payload_response = search_call["search_answer_response"]["template"]["graph_answer"]["payload"];
-    // console.log(`Payload : ${payload_response}`);
     let input_data = {};
     let snippet_title = [];
     let snippet_content = [];
     let snippet_urls = [];
-    let snippet_scores = [];
     let snippet_type = "";
+    let graph_answer = search_call["search_answer_response"]["template"]["graph_answer"];
     if(Object.keys(payload_response).length){
       snippet_type =
       search_call["search_answer_response"]["template"]["graph_answer"][
@@ -365,7 +474,6 @@ async function pre_processing(search_call, user_input, embedings_model) {
         snippet_title.push(input_data.snippet_title);
         snippet_content.push(snippet_content_as_string);
         snippet_urls.push(input_data.url);
-        snippet_scores.push(input_data.score);
   
       } else {
         input_data =
@@ -374,7 +482,6 @@ async function pre_processing(search_call, user_input, embedings_model) {
           snippet_content.push(input_data[i]["answer_fragment"]);
           snippet_title.push(input_data[i]["sources"][0]["title"]);
           snippet_urls.push(input_data[i]["sources"][0]["url"]);
-          snippet_scores.push("NA")
         }
       }
   
@@ -382,33 +489,36 @@ async function pre_processing(search_call, user_input, embedings_model) {
   
 
     // model performance
-    let result_metrics = await get_metrics(user_input, snippet_title, snippet_content, snippet_urls, snippet_scores,embedings_model);
+    let result_metrics = {};
+    result_metrics = await get_metrics(user_input, graph_answer, snippet_title, snippet_content, snippet_urls, embeddings_model, {llmEvaluation: true, retrievalEvaluation: false});
     result_metrics["Model_used"] = snippet_type
-    // console.log(result_metrics)
 
     // calling Debuuger if the ans status is false
     let debugger_input_data = {}
     let debugger_chunk_content = []
     let debugger_chunk_url = []
-    let debugger_chunk_score = []
-    let debugger_chuck_title = []
-    let debugger_result_metrics
+    let debugger_chunk_title = []
+    let debugger_result_metrics = {}
 
-    if (search_call['debug_answer_response'] ) {
+    if (search_call['debug_answer_response']['answer_debug'] != null ) {
       // console.log("<<<<<<<<<<<<<<<<<< Debugger >>>>>>>>>>>>>>>>>")
-
+      let llmAnswer = {};
       if (search_call["debug_answer_response"]["answer_debug"]["generative_answers"]) {
         debugger_input_data = search_call["debug_answer_response"]["answer_debug"]["generative_answers"]["qualified_chunks"]["chunks"];
+        llmAnswer = search_call["debug_answer_response"]["answer_debug"]["generative_answers"]?.llm_response?.response_details || {}
       }
       else if (search_call["debug_answer_response"]["answer_debug"]["extractive_answers"]) {
         debugger_input_data = search_call["debug_answer_response"]["answer_debug"]["extractive_answers"]["qualified_chunks"]["chunks"]; 
       }
+      let chunk_ranks = [];
       for (let i = 0; i < debugger_input_data.length; i++) {
         debugger_chunk_content.push(debugger_input_data[i]["chunk_text"]);
         debugger_chunk_url.push(debugger_input_data[i]["source_url"]);
-        debugger_chunk_score.push(debugger_input_data[i]["score"])
         chunk_more_info = debugger_input_data[i]['more_info']
         let chunk_title = debugger_input_data[i]["source_name"]
+        if(debugger_input_data[i]["used_in_answer"]){
+          chunk_ranks.push(i+1);
+        }
         if (chunk_more_info) {
           chunk_more_info.forEach(item => {
             if (item.key === "Chunk Title") {
@@ -416,16 +526,18 @@ async function pre_processing(search_call, user_input, embedings_model) {
             }
           });
         }
-        debugger_chuck_title.push(chunk_title);
+        debugger_chunk_title.push(chunk_title);
       }
 
-      // console.log(debugger_chunk_content)
-      // console.log(debugger_chunk_url)
-      // console.log(debugger_chuck_title)
-
-      debugger_result_metrics = await get_metrics(user_input, debugger_chuck_title, debugger_chunk_content, debugger_chunk_url,debugger_chunk_score, embedings_model,true)
+      options = {
+        "debug_answer_response": search_call['debug_answer_response'],
+        "retrievalEvaluation": true
+      }
+      debugger_result_metrics = await get_metrics(user_input, graph_answer, debugger_chunk_title, debugger_chunk_content, debugger_chunk_url, embeddings_model, options)
+      debugger_result_metrics["rulesUsed"] = search_call["search_answer_response"]?.debug?.rulesOutcomes || {}
+      debugger_result_metrics["llmAnswer"] = llmAnswer
+      debugger_result_metrics["chunk_ranks"] = chunk_ranks
       debugger_result_metrics['debug_payload'] = debugger_input_data
-      // console.log(debugger_result_metrics)
     }
 
     return {
@@ -435,15 +547,13 @@ async function pre_processing(search_call, user_input, embedings_model) {
 
 
   } catch (error) {
-    if (Object.keys(payload_response).length === 0 && payload_response.constructor === Object) {
-      // console.log("Payload is empty");
-    }
-    else {
-      console.log(`Unable to retrieve the information, ${error}`);
+    console.log(`Unable to retrieve the information, ${error}`);
+
+    return {
+      "result_metrics": result_metrics,
+      "debugger_result_metrics": debugger_result_metrics
     }
   }
-
-
 }
 
 async function updateJsonFile(filePath, keyToUpdate, newValue) {
@@ -456,40 +566,51 @@ async function updateJsonFile(filePath, keyToUpdate, newValue) {
 
   // Write the updated data back to the file
   fs.writeFileSync(filePath, JSON.stringify(existingData, null, 2), 'utf8');
-
-  // console.log(`JSON file updated successfully. Updated ${keyToUpdate} to ${newValue}`);
 }
 
 async function get_results(CSV_file_path) {
   const server_2_response = await get_config_data(CSV_file_path);
   const Credentials = server_2_response["credentials"]; //json
   const csv_data = server_2_response["csv_data"]; // list
-  //   console.log(server_2_response);
-  // console.log(Credentials.start_index,csv_data.length)
+  let llmApiKey = Credentials.llmApiKey || "";
+  openai.apiKey = llmApiKey;
   for (let index = Credentials.start_index; index < csv_data.length; index++) {
-    //   console.log(index);
     try {
+      const query = csv_data[index]["User_Query"];
+      if(!query){
+        break;
+      }
       const search_call = await makeAPostRequest(
-        csv_data[index]["User_Query"],
-        Credentials
+        query,
+        Credentials, csv_data[index], index
       );
-
-      const final_results = await pre_processing(search_call, csv_data[index], Credentials.embedings_model); //so we are passing an index index here
-
+      const final_results = await pre_processing(search_call, csv_data[index], Credentials.embeddings_model); //so we are passing an index index here
       var appending_objects = {}
 
       appending_objects["index"] = index
       appending_objects["User_Query"] = csv_data[index]["User_Query"]
+      appending_objects["Status"] = csv_data[index]["Status"]
+      appending_objects["GuideID"] = csv_data[index]["GuideID"]
+      appending_objects["TopicID"] = csv_data[index]["TopicID"]
+      appending_objects["HelpID"] = csv_data[index]["HelpID"]
+      appending_objects["ResearchLinks"] = csv_data[index]["ResearchLinks"]
       appending_objects["Expected_Ans"] = csv_data[index]["Expected_Ans"]
       appending_objects["Expected_URL"] = csv_data[index]["Expected_URL"]
       appending_objects["Expected_Title"] = csv_data[index]["Expected_Title"]
       appending_objects["Answer_Snippet"] = final_results.result_metrics.data_index
       appending_objects["Actual_Title"] = final_results.result_metrics.actual_title
       appending_objects["Actual_URL"] = final_results.result_metrics.actual_url
-      appending_objects["Actual_Score"] = final_results.result_metrics.actual_score
       appending_objects["Answer_Status"] = final_results.result_metrics.Ans_Status
       appending_objects["URL_status"] = Boolean(final_results.result_metrics.url_status)
       appending_objects["Title_Status"] = Boolean(final_results.result_metrics.title_status)
+      appending_objects["Evaluation_Response"] = final_results?.result_metrics?.evalResponse || "";
+      appending_objects["Evaluation_Feedback"] = final_results?.result_metrics?.evaluationFeedback || "";
+      appending_objects["Evaluation_Score"] = final_results?.result_metrics?.evaluationScore || "";
+      appending_objects["retrievalEvalStatus"] = final_results?.debugger_result_metrics?.retrievalEvalStatus || "";
+      appending_objects["sourceUsed"] = final_results?.debugger_result_metrics?.sourceUsed || "";
+      appending_objects["expectedChunkRanks"] = final_results?.debugger_result_metrics?.expectedChunkRanks || "";
+
+      
       appending_objects["Chunk_Text"] = ""
 
       if (final_results.debugger_result_metrics) {
@@ -512,12 +633,13 @@ async function get_results(CSV_file_path) {
 
       appending_objects["Model_Used"] = final_results.result_metrics.Model_used
       appending_objects['Top_Chunks'] = final_results.debugger_result_metrics['debug_payload']
-      // console.log(typeof appending_objects["Answer_Snippet"])
-
-      // console.log(appending_objects)
-      //appendToJSON(appending_objects, output_file_path)
-      appendToCSV(appending_objects, output_file_path)
+      appending_objects['Chunk_Ranks'] = final_results.debugger_result_metrics['chunk_ranks'] || [];
+      appending_objects['Max_Chunk_Rank'] = Math.max(...appending_objects['Chunk_Ranks'])
+      appending_objects['rulesUsed'] = final_results.debugger_result_metrics['rulesUsed']
+      appending_objects['llmAnswer'] = final_results.debugger_result_metrics['llmAnswer']
+      appendToJSON(appending_objects, output_file_path)
       updateJsonFile(jsonFilePath, "start_index", index)
+      // break //find
     }
     catch (err) {
       console.log(err);
@@ -527,4 +649,5 @@ async function get_results(CSV_file_path) {
 
 (async () => {
   const query_info = await get_results(CSV_file_path);
+  console.log("Script execution done successfully!!")
 })();
